@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.so
+*.o
+build/
+dist/
+*.egg-info/
+*.pth
+*.ckpt
+.vscode/
+.idea/
+dataset/
+wandb/
