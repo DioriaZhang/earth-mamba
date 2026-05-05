@@ -45,11 +45,21 @@ pretrain_mae.py  ─  EarthMamba MAE/SimMIM 预训练脚本
   • 下采样: v3 版 Conv(k=3, s=2, p=1) → 对奇偶空间维均无丢边
   • 解码器: 双线性插值 + Conv → 动态适配任意输入分辨率
 
+数据 txt 格式（每行 Tab 分隔）
+─────────────────────────────────────────────────
+  A001\t/data/rs/scene_001
+  A002\t/data/rs/scene_002
+  # 注释行以 # 开头，自动跳过
+  B003\t/data/rs/scene_003
+
+  每个文件夹下的图片（jpg/png/tif/tiff/webp/bmp）全部被加入样本池。
+  图片应已预处理为 512×512，格式不限。
+
 使用示例
 ─────────────────────────────────────────────────
 单卡调试：
   python pretrain_mae.py \
-      --data_root /path/to/512x512_images \
+      --data_list /data/pretrain_list.txt \
       --output_dir ./pretrain_out \
       --model_size small --patch_size 16 \
       --batch_size 16 --epochs 800 --warmup_epochs 40 \
@@ -57,11 +67,14 @@ pretrain_mae.py  ─  EarthMamba MAE/SimMIM 预训练脚本
 
 多卡 DDP（4 卡）：
   torchrun --nproc_per_node=4 pretrain_mae.py \
-      --data_root /path/to/512x512_images \
+      --data_list /data/pretrain_list.txt \
       --output_dir ./pretrain_out \
       --model_size small --patch_size 16 \
       --batch_size 8 --grad_accum 2 \
       --epochs 800 --amp --amp_dtype bf16
+
+文件夹含子目录时加 --rglob：
+  python pretrain_mae.py --data_list list.txt --rglob ...
 
 微调时加载预训练骨干权重：
   backbone = BackboneEarthMamba(...)
@@ -173,27 +186,73 @@ _normalize  = transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD)
 
 class PretrainDataset(Dataset):
     """
-    扁平目录图像数据集（所有图像已预处理为 primary×primary）。
+    从 txt 索引文件加载图像数据集（所有图像已预处理为 512×512）。
 
+    txt 格式（每行一条，字段以 Tab 分隔）：
+        <ID>\\t<图片文件夹路径>
+    例：
+        A001\\t/data/rs/scene_001
+        A002\\t/data/rs/scene_002
+
+    - 每个文件夹下的全部直接子文件都被枚举（不递归进子目录，避免嵌套歧义）。
+      若确实有多层子目录，可把 rglob=True 参数传为 True 开启递归。
     - __getitem__ 返回 PIL.Image（未 resize / 未 normalize），
-      尺寸转换由 MultiScaleCollator 在 batch 级别统一完成。
-    - 支持常见遥感图像格式：jpg / jpeg / png / tif / tiff / webp / bmp。
-      对 16-bit TIFF / 多波段 TIFF：转 8-bit RGB 时取前 3 个波段，
-      像素范围线性归一到 [0, 255]（仅当 mode 不是常规 RGB 时触发）。
-    - 递归扫描目录（含子目录），suffix 大小写不敏感。
+      尺寸变换由 MultiScaleCollator 在 batch 级别统一完成。
+    - 支持多格式：jpg / jpeg / png / tif / tiff / webp / bmp。
+      高位深 / 多波段 TIFF 自动归一到 8-bit RGB。
+    - 跳过空行和 '#' 开头的注释行。
+    - 文件夹不存在或文件夹下无图片时跳过（打印 warning），不崩溃。
     """
 
     EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
 
-    def __init__(self, root: str, primary_size: int = 512):
-        self.root = Path(root)
+    def __init__(self, txt_file: str, primary_size: int = 512, rglob: bool = False):
         self.primary_size = primary_size
-        self.paths: List[Path] = sorted(
-            p for p in self.root.rglob("*")
-            if p.suffix.lower() in self.EXTENSIONS
-        )
+        self.paths: List[Path] = []
+        # 记录每条图片对应的 ID，方便调试；不参与训练
+        self.ids:   List[str]  = []
+
+        txt_path = Path(txt_file)
+        if not txt_path.exists():
+            raise FileNotFoundError(f"索引文件不存在: {txt_file}")
+
+        missing_dirs = []
+        with open(txt_path, encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"{txt_file}:{lineno} 格式错误，"
+                        f"期望 <ID>\\t<文件夹路径>，实际: {line!r}"
+                    )
+                sample_id, folder_str = parts[0].strip(), parts[1].strip()
+                folder = Path(folder_str)
+                if not folder.is_dir():
+                    missing_dirs.append((lineno, folder))
+                    continue
+
+                scanner = folder.rglob("*") if rglob else folder.iterdir()
+                imgs = sorted(
+                    p for p in scanner
+                    if p.is_file() and p.suffix.lower() in self.EXTENSIONS
+                )
+                for img_path in imgs:
+                    self.paths.append(img_path)
+                    self.ids.append(sample_id)
+
+        if missing_dirs:
+            for lineno, d in missing_dirs[:5]:
+                print(f"[PretrainDataset] warning: 第 {lineno} 行文件夹不存在，已跳过: {d}")
+            if len(missing_dirs) > 5:
+                print(f"  ... 共 {len(missing_dirs)} 个缺失文件夹")
+
         if len(self.paths) == 0:
-            raise RuntimeError(f"在 {root} 下未找到任何图像文件")
+            raise RuntimeError(
+                f"从 {txt_file} 中未找到任何图像文件，请检查路径和格式。"
+            )
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -203,17 +262,16 @@ class PretrainDataset(Dataset):
         """
         将任意 PIL Image 安全转换为 8-bit RGB。
 
-        - mode == 'RGB' : 直接返回
-        - mode 含 alpha (RGBA / LA / P) : 转 RGB 丢弃 alpha
-        - 16-bit / 32-bit TIFF (mode I, I;16, F) : 线性归一到 [0,255] 再复制三通道
-        - 多波段 TIFF : 取前 3 个波段
+        - RGB         : 直接返回
+        - RGBA/LA/P/L : 转 RGB（丢弃 alpha 或灰度扩展为三通道）
+        - 高位深 / 浮点 TIFF (I, I;16, F) : 线性归一到 [0,255] → RGB
+        - 多波段（通道 ≥ 3）: 取前 3 个波段
         """
         mode = img.mode
         if mode == "RGB":
             return img
         if mode in ("RGBA", "LA", "P", "L"):
             return img.convert("RGB")
-        # 高位深 / 浮点：用 numpy 线性归一
         arr = np.asarray(img)
         if arr.dtype != np.uint8:
             lo, hi = float(arr.min()), float(arr.max())
@@ -221,10 +279,10 @@ class PretrainDataset(Dataset):
                 arr = np.zeros_like(arr, dtype=np.uint8)
             else:
                 arr = ((arr - lo) / (hi - lo) * 255.0).clip(0, 255).astype(np.uint8)
-        if arr.ndim == 2:                 # 单通道 → 复制三通道
+        if arr.ndim == 2:
             arr = np.stack([arr] * 3, axis=-1)
         elif arr.ndim == 3 and arr.shape[-1] >= 3:
-            arr = arr[..., :3]            # 多波段 → 取前 3
+            arr = arr[..., :3]
         elif arr.ndim == 3 and arr.shape[-1] == 1:
             arr = np.repeat(arr, 3, axis=-1)
         else:
@@ -236,7 +294,7 @@ class PretrainDataset(Dataset):
             img = Image.open(self.paths[idx])
             return self._safe_to_rgb(img)
         except Exception:
-            # 损坏文件：返回纯黑 primary×primary 占位图（不会污染太多 step）
+            # 损坏文件：返回纯黑占位图，不中断训练
             return Image.new("RGB", (self.primary_size, self.primary_size), 0)
 
 
@@ -838,7 +896,10 @@ def build_args() -> argparse.Namespace:
 
     # ── 数据 ──────────────────────────────────────────────────────────────────
     g = p.add_argument_group("数据")
-    g.add_argument("--data_root",   required=True,  help="512×512 图像根目录（递归扫描）")
+    g.add_argument("--data_list",   required=True,
+                   help="索引 txt 文件路径，每行: <ID>\\t<图片文件夹路径>")
+    g.add_argument("--rglob",       action="store_true", default=False,
+                   help="递归扫描文件夹子目录（默认只扫顶层）")
     g.add_argument("--output_dir",  default="./pretrain_output")
     g.add_argument("--num_workers", type=int, default=8)
 
@@ -959,7 +1020,11 @@ def main():
         )
 
     # ── 数据集 & DataLoader ───────────────────────────────────────────────────
-    dataset = PretrainDataset(root=args.data_root, primary_size=args.primary_size)
+    dataset = PretrainDataset(
+        txt_file=args.data_list,
+        primary_size=args.primary_size,
+        rglob=args.rglob,
+    )
     sampler = DistributedSampler(dataset, shuffle=True) if use_ddp else None
     collator = MultiScaleCollator(
         primary=args.primary_size,
