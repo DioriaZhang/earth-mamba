@@ -1,44 +1,49 @@
 """
-pretrain_mae.py  ─  EarthMamba SimMIM 风格预训练脚本
+pretrain_mae.py  ─  EarthMamba MAE/SimMIM 预训练脚本
 =====================================================
+
+训练策略一句话
+─────────────
+  以 512×512 为主尺度，采用少量整数倍 patch 对齐的尺度扰动；
+  预训练采用 MAE 的随机遮挡重建目标；
+  模型端支持位置编码 bicubic 插值的可变分辨率机制，
+  以保证推理不锁死输入尺寸。
 
 分辨率采样策略（所有输入图像已预处理为 512×512）
 ─────────────────────────────────────────────────
-  • 80-90%（默认 primary_prob=0.85）批次：
-      直接使用 512×512，随机水平翻转 + 颜色抖动，无 resize。
-  • 10-20% 批次：
-      随机缩放因子 r ∈ [min_scale, max_scale]（默认 0.85~1.15，即 ±15%），
-      将 512 缩放到 [435, 589]，再对齐到 patch_size（默认 16）整数倍
-      → 合法候选: 448, 464, 480, 496, 528, 544, 560, 576, 592。
-      同一批次所有样本使用相同目标分辨率，保证 batch 可 stack。
+  • 85% 批次（primary_prob=0.85）：
+      直接使用 512×512，无 resize。
 
-  注：EarthMamba 共 4 个 stage、3 次 stride=2 下采样，最深特征图 = H/128。
-       512 是唯一同时满足 patch_size(16) 和 128 整除的尺寸。
-       为让 480/528/560 等"仅 16 倍但非 128 倍"分辨率能干净下采样，
-       本脚本固定使用 downsample_version="v3"（kernel=3,stride=2,padding=1，
-       ConvNeXt 标准做法，对任意 patch_size 整数倍输入向上取整无丢边）。
+  • 15% 批次（尺度扰动）：
+      从预定义的离散候选表中均匀抽取一个辅尺度，例如：
+          patch_size=16 时: [448, 480, 544, 576]
+      候选表由 patch_size 的整数倍自动生成，确保 token 网格严格整数、
+      无需 padding / 截断。同一批次内所有样本使用相同辅尺度。
+
+  • 为何选离散候选表而非随机百分比缩放？
+      ViT/Mamba 的 patch 嵌入要求输入 H, W 均为 patch_size 的整数倍。
+      如果按百分比连续缩放再四舍五入，会产生 460, 489, 537 等"别扭"尺寸，
+      token 网格不规则且不可复现。离散候选表一次性定义好合法尺寸，
+      训练和推理行为完全可预测。
 
 预训练方法：SimMIM（Masked Image Modeling）
 ─────────────────────────────────────────────────
   1. 在 patch 网格（H/patch_size × W/patch_size）上随机采样掩码（mask_ratio=0.6）
-  2. 被掩码的 patch 区域在像素空间替换为可学习掩码值（一维标量扩展）
+  2. 被掩码的 patch 区域在像素空间替换为可学习掩码值
   3. 完整 EarthMamba 编码器处理含掩码的输入（所有 patch 均参与编码）
-  4. 轻量解码头（像素级上采样 Conv）从最后一阶段特征预测原始像素值
-  5. 损失：仅在被掩码的 patch 像素上计算归一化 L1
+  4. 轻量解码头上采样到输入分辨率，预测原始像素值
+  5. 损失：仅在被掩码 patch 的像素上计算归一化 L1
 
-  为何选 SimMIM 而非 DINO（教师-学生）？
-    遥感图像样本量通常远小于 ImageNet，DINO 双分支 + EMA 教师对显存
-    与多视角增广要求高；SimMIM 单模型 + 像素重建对纹理细节更敏感，
-    更契合遥感场景。
-
-模型结构对推理阶段的可变分辨率支持
+模型端可变分辨率机制
 ─────────────────────────────────────────────────
-  • posembed=False（默认）→ 无固定尺寸位置编码，任意分辨率均可推理
-  • patch_embed: Conv2d(3, dim, kernel=patch_size, stride=patch_size)
-      → 支持任意 H, W（只需是 patch_size 的整数倍）
-  • 下采样：v3 版（Conv kernel=3 stride=2 padding=1）→ 任意 patch_size 倍输入皆可
-  • 编码器输出归一化使用 GroupNorm（与空间尺寸无关）
-  • 解码器：双线性插值 + Conv，动态上采样到输入分辨率 → 尺寸完全无关
+  • 2D 可学习位置编码（posembed=True，训练分辨率 = 512/patch_size = 32×32）：
+      推理/微调遇到不同分辨率时，自动 bicubic 插值到新的 token 网格尺寸
+      （与 DINOv2 / FlexiViT 的做法一致）。
+      训练时多尺度批次已在不同 token 网格下执行过插值，
+      让位置编码从训练阶段就学会了对尺度变化的适应。
+  • patch_embed: Conv2d(stride=patch_size) → 支持任意 patch_size 整数倍的 H, W
+  • 下采样: v3 版 Conv(k=3, s=2, p=1) → 对奇偶空间维均无丢边
+  • 解码器: 双线性插值 + Conv → 动态适配任意输入分辨率
 
 使用示例
 ─────────────────────────────────────────────────
@@ -46,10 +51,8 @@ pretrain_mae.py  ─  EarthMamba SimMIM 风格预训练脚本
   python pretrain_mae.py \
       --data_root /path/to/512x512_images \
       --output_dir ./pretrain_out \
-      --model_size small \
-      --patch_size 16 \
-      --batch_size 16 \
-      --epochs 800 --warmup_epochs 40 \
+      --model_size small --patch_size 16 \
+      --batch_size 16 --epochs 800 --warmup_epochs 40 \
       --amp --amp_dtype bf16
 
 多卡 DDP（4 卡）：
@@ -114,42 +117,48 @@ except ImportError as e:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  第一节：多尺度分辨率采样工具
+#  第一节：离散多尺度分辨率采样
 # ══════════════════════════════════════════════════════════════════════════════
 
-def snap_to_patch_multiple(value: float, patch_size: int) -> int:
-    """将 *value* 取整到最近的 patch_size 正整数倍（最小为 patch_size 本身）。"""
-    return max(patch_size, round(value / patch_size) * patch_size)
+def build_scale_candidates(
+    primary: int = 512,
+    patch_size: int = 16,
+    min_scale: float = 0.85,
+    max_scale: float = 1.15,
+) -> List[int]:
+    """
+    生成离散辅尺度候选表（patch_size 的严格整数倍，且排除 primary 本身）。
+
+    例：primary=512, patch_size=16, ±15%
+        下界 = 512 * 0.85 = 435.2 → 向上取整到 448
+        上界 = 512 * 1.15 = 588.8 → 向下取整到 576
+        候选: [448, 464, 480, 496, 528, 544, 560, 576]
+             （512 自身被排除，因为它已由 primary_prob 控制）
+    """
+    lo = int(math.ceil (primary * min_scale / patch_size)) * patch_size
+    hi = int(math.floor(primary * max_scale / patch_size)) * patch_size
+    candidates = list(range(lo, hi + 1, patch_size))
+    candidates = [s for s in candidates if s != primary]
+    return candidates
 
 
 def sample_batch_resolution(
-    primary: int = 512,
-    patch_size: int = 16,
+    primary: int,
+    candidates: List[int],
     primary_prob: float = 0.85,
-    min_scale: float = 0.85,
-    max_scale: float = 1.15,
     rng: Optional[random.Random] = None,
 ) -> int:
     """
-    采样本批次使用的分辨率（所有图像已是 primary 尺寸）。
+    采样本批次使用的分辨率。
 
-    - 以 primary_prob 概率返回 primary（主分辨率，无需 resize）。
-    - 否则从 [min_scale, max_scale] 均匀采样缩放因子，
-      计算目标边长并对齐到 patch_size 整数倍。
-    - 为避免采样到与 primary 几乎相同的尺寸，排除
-      (primary ± patch_size/2) 区间。
+    - 以 primary_prob 概率返回 primary（主分辨率 512，无需 resize）。
+    - 否则从 candidates（离散候选表）中**均匀随机**抽取一个辅尺度。
+    - candidates 为空时始终返回 primary。
     """
     _rng = rng or random
-    if _rng.random() < primary_prob:
+    if not candidates or _rng.random() < primary_prob:
         return primary
-
-    # 采样缩放因子，排除接近 1.0 的区间（避免产生与 primary 相差极小的尺寸）
-    lo, hi = min_scale, max_scale
-    while True:
-        scale = _rng.uniform(lo, hi)
-        target = snap_to_patch_multiple(primary * scale, patch_size)
-        if abs(target - primary) >= patch_size:   # 至少差一个 patch
-            return target
+    return _rng.choice(candidates)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -233,16 +242,18 @@ class PretrainDataset(Dataset):
 
 class MultiScaleCollator:
     """
-    Batch 级别多尺度 Collator。
+    Batch 级别多尺度 Collator（离散候选表版本）。
 
     设计原则（输入图像均为 512×512）：
     ─────────────────────────────────
-    • primary_prob（默认 85%）概率：目标分辨率 = 512。
+    • primary_prob（默认 85%）概率：目标分辨率 = 512（主尺度）。
         图像已是 512×512，无需 resize；只做随机翻转 + 颜色抖动 + normalize。
-    • 1-primary_prob 概率：目标分辨率 = 随机采样的 ±10-15% 尺寸。
-        将 512 PIL 双线性缩放到目标尺寸，再做翻转 + 颜色抖动 + normalize。
 
-    同一批次内所有样本使用相同目标分辨率，保证 torch.stack 不报错。
+    • 1-primary_prob 概率：从离散候选表中均匀抽取一个辅尺度。
+        候选表由 patch_size 整数倍自动生成，如 [448, 480, 544, 576]。
+        将 512 双线性缩放到选中的辅尺度。
+
+    同一批次内所有样本使用相同目标分辨率 → torch.stack 无歧义。
     """
 
     def __init__(
@@ -250,17 +261,15 @@ class MultiScaleCollator:
         primary: int = 512,
         patch_size: int = 16,
         primary_prob: float = 0.85,
-        min_scale: float = 0.85,
-        max_scale: float = 1.15,
+        candidates: Optional[List[int]] = None,
         hflip_prob: float = 0.5,
-        vflip_prob: float = 0.5,     # 遥感场景上下翻转语义合法
-        color_jitter: float = 0.2,   # 遥感保守值；0 = 关闭
+        vflip_prob: float = 0.5,
+        color_jitter: float = 0.2,
     ):
         self.primary = primary
         self.patch_size = patch_size
         self.primary_prob = primary_prob
-        self.min_scale = min_scale
-        self.max_scale = max_scale
+        self.candidates = candidates or []
         self.hflip_prob = hflip_prob
         self.vflip_prob = vflip_prob
         self._rng = random.Random()
@@ -278,42 +287,29 @@ class MultiScaleCollator:
     # ------------------------------------------------------------------
     def _augment_one(self, img: Image.Image, size: int) -> torch.Tensor:
         """对单张 PIL 图像做尺寸调整 + 数据增强，返回归一化 Tensor。"""
-        # 1. Resize（仅当目标尺寸与当前尺寸不同时才执行）
         if img.width != size or img.height != size:
             img = img.resize((size, size), Image.BILINEAR)
 
-        # 2. 颜色抖动（遥感图像适当保守）
         if self._color_jitter is not None:
             img = self._color_jitter(img)
 
-        # 3. 随机翻转
         if self._rng.random() < self.hflip_prob:
             img = TF.hflip(img)
         if self._rng.random() < self.vflip_prob:
             img = TF.vflip(img)
 
-        # 4. → Tensor → Normalize
-        return _normalize(_to_tensor(img))   # (3, size, size)
+        return _normalize(_to_tensor(img))
 
     # ------------------------------------------------------------------
     def __call__(self, batch: List[Image.Image]) -> torch.Tensor:
-        """
-        Args:
-            batch: list of PIL.Image，长度 = batch_size
-
-        Returns:
-            tensor: (B, 3, size, size)，dtype=float32
-        """
         size = sample_batch_resolution(
             primary=self.primary,
-            patch_size=self.patch_size,
+            candidates=self.candidates,
             primary_prob=self.primary_prob,
-            min_scale=self.min_scale,
-            max_scale=self.max_scale,
             rng=self._rng,
         )
         tensors = [self._augment_one(img, size) for img in batch]
-        return torch.stack(tensors, dim=0)   # (B, 3, size, size)
+        return torch.stack(tensors, dim=0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -363,29 +359,24 @@ class EarthMambaForPretraining(nn.Module):
 
     前向流程
     ────────
-    1. 在 patch 网格（Hp × Wp）随机采样布尔掩码 M（mask_ratio 的位置为 True）
+    1. 在 patch 网格（Hp × Wp）随机采样布尔掩码 M（mask_ratio=0.6 的位置为 True）
     2. 将输入图像中被掩码 patch 的像素替换为可学习掩码值 mask_value
-    3. 完整编码器处理含掩码的输入（所有 patch 均参与编码，符合 SimMIM 设计）
-    4. 解码器将特征图上采样到输入分辨率，输出像素级预测
-    5. 仅在被掩码 patch 区域计算归一化 L1 损失
+    3. patch_embed 后加入 2D 可学习位置编码（如遇辅尺度自动 bicubic 插值）
+    4. 完整编码器处理含掩码的输入（所有 patch 均参与编码，符合 SimMIM 设计）
+    5. 解码器将特征图上采样到输入分辨率，输出像素级预测
+    6. 仅在被掩码 patch 区域计算归一化 L1 损失
 
-    推理时的可变分辨率支持
-    ────────────────────────
-    - posembed=False → 无固定尺寸位置编码
+    可变分辨率机制（推理不锁死输入尺寸）
+    ────────────────────────────────────────
+    - 2D 可学习位置编码以主分辨率 512 训练（32×32 token 网格 @ patch_size=16）；
+      训练时遇到辅尺度批次（如 448 → 28×28）自动 bicubic 插值位置编码，
+      让权重从训练阶段就学会尺度适应。
+      推理时遇到任意分辨率同样做 bicubic 插值 → 无需微调即可迁移。
+      这与 DINOv2 / FlexiViT 的位置编码处理方式一致。
     - patch_embed、downsample 均为纯卷积 → H, W 只需是 patch_size 的整数倍
     - 解码器双线性插值 → 尺寸无关
-    - 推理阶段直接调用 self.forward_features(x) 获取骨干特征
-
-    Args:
-        model_size   : 'tiny' | 'small' | 'base' | 'large'
-        patch_size   : patch 边长（建议 16，减少 token 数）
-        mask_ratio   : 每批次被掩码的 patch 比例（0~1）
-        norm_pix_loss: 是否对 patch 像素做归一化再计算损失（稳定训练）
-        ssm_version  : 'mamba1'（默认）| 'mamba3'
-        ssm_backend  : SSM CUDA 后端（None = 自动）
     """
 
-    # 各模型规格配置
     MODEL_CONFIGS = {
         "tiny":  {"depths": [2, 2,  9, 2], "dims": [ 96, 192,  384,  768]},
         "small": {"depths": [2, 2, 27, 2], "dims": [ 96, 192,  384,  768]},
@@ -397,6 +388,7 @@ class EarthMambaForPretraining(nn.Module):
         self,
         model_size: str = "small",
         patch_size: int = 16,
+        primary_size: int = 512,
         mask_ratio: float = 0.60,
         norm_pix_loss: bool = True,
         decoder_hidden: int = 512,
@@ -407,22 +399,25 @@ class EarthMambaForPretraining(nn.Module):
         use_checkpoint: bool = False,
     ):
         super().__init__()
-        self.patch_size   = patch_size
-        self.mask_ratio   = mask_ratio
+        self.patch_size    = patch_size
+        self.primary_size  = primary_size
+        self.mask_ratio    = mask_ratio
         self.norm_pix_loss = norm_pix_loss
 
         cfg = self.MODEL_CONFIGS[model_size]
-        encoder_dim = cfg["dims"][-1]   # 最后阶段输出通道数
+        encoder_dim = cfg["dims"][-1]
 
-        # ── 编码器：EarthMamba 去掉分类头 ──────────────────────────────
-        # 使用完整 EarthMamba 但在 forward_features 中跳过 classifier
+        # 主分辨率对应的 token 网格尺寸（位置编码的训练尺寸）
+        self.train_grid = primary_size // patch_size   # 512/16 = 32
+
+        # ── 编码器：EarthMamba（posembed=True + 位置编码由本类管理插值）──
         _ssm_d_state = 64 if ssm_version == "mamba3" else 16
         self.encoder = EarthMamba(
             depths=cfg["depths"],
             dims=cfg["dims"],
             patch_size=patch_size,
             in_chans=3,
-            num_classes=1,            # 占位值，classifier 创建后立即删除
+            num_classes=1,
             ssm_d_state=_ssm_d_state,
             ssm_ratio=2.0,
             ssm_version=ssm_version,
@@ -431,27 +426,31 @@ class EarthMambaForPretraining(nn.Module):
             use_armg=True,
             use_graph=True,
             norm_layer="ln",
-            posembed=False,           # ★ 无固定尺寸位置编码 → 推理时可变分辨率
+            posembed=True,            # ★ 开启 2D 可学习位置编码
+            imgsize=primary_size,     # ★ 以 512 为训练分辨率初始化 pos_embed
             drop_path_rate=drop_path_rate,
             use_checkpoint=use_checkpoint,
-            downsample_version="v3",  # ★ Conv k=3 s=2 p=1 → 任意 patch_size 倍输入无丢边
+            downsample_version="v3",
         )
-        # 删除分类头（节省显存）
         del self.encoder.classifier
+
+        # 将 encoder 的 pos_embed 移到本类管理（本类负责插值逻辑）
+        # encoder.pos_embed shape: (1, C, train_grid, train_grid)
+        self.pos_embed = self.encoder.pos_embed
+        self.encoder.pos_embed = None
 
         self.encoder_dim = encoder_dim
 
-        # ── 可学习掩码值（在 normalize 后的空间，每通道一个标量）──────
-        # shape: (1, 3, 1, 1)，会被广播到 patch 区域
+        # ── 可学习掩码值 ──────────────────────────────────────────────
         self.mask_value = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
-        # ── 解码头：上采样 + 像素预测 ───────────────────────────────────
+        # ── 解码头 ───────────────────────────────────────────────────
         self.decoder = SimMIMDecoder(
             encoder_dim=encoder_dim,
             hidden_dim=decoder_hidden,
         )
 
-        # ── 编码器输出归一化（接在最后阶段特征图之后）──────────────────
+        # ── 编码器输出归一化 ──────────────────────────────────────────
         self.enc_norm = nn.GroupNorm(num_groups=32, num_channels=encoder_dim)
 
         self._init_weights()
@@ -459,6 +458,28 @@ class EarthMambaForPretraining(nn.Module):
     # ------------------------------------------------------------------
     def _init_weights(self):
         nn.init.normal_(self.mask_value, std=0.02)
+
+    # ------------------------------------------------------------------
+    def _interpolate_pos_embed(self, Hp: int, Wp: int) -> torch.Tensor:
+        """
+        将训练分辨率的 2D 位置编码 bicubic 插值到目标 token 网格 (Hp, Wp)。
+
+        self.pos_embed 形状: (1, C, train_grid, train_grid)   [channel-first]
+        返回形状:             (1, C, Hp, Wp)
+
+        训练时 85% 批次 Hp=Wp=train_grid → 直接返回（无额外计算）；
+        辅尺度批次（如 448 → Hp=28）→ bicubic 插值，让位置编码在训练阶段
+        就学习到尺度适应能力。
+        推理时遇到任意分辨率走同一条路径 → 不锁死分辨率。
+        """
+        pos_embed = self.pos_embed                       # (1, C, Hg, Wg)
+        Hg, Wg = pos_embed.shape[2], pos_embed.shape[3]
+        if Hp == Hg and Wp == Wg:
+            return pos_embed
+        return F.interpolate(
+            pos_embed, size=(Hp, Wp),
+            mode="bicubic", align_corners=False,
+        )
 
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -518,17 +539,33 @@ class EarthMambaForPretraining(nn.Module):
         """
         仅前向通过编码器（不计算损失），用于推理 / 下游微调特征提取。
 
+        位置编码处理逻辑：
+          - patch_embed 输出的 token 网格 (Hp, Wp) 可能与训练网格 (train_grid, train_grid) 不同
+          - 主分辨率 512 → Hp=Wp=32 与训练网格一致 → 直接加
+          - 辅尺度 / 推理分辨率 → bicubic 插值位置编码到 (Hp, Wp) → 再加
+
         Args:
             x : (B, 3, H, W)，H 和 W 须是 patch_size 的整数倍
 
         Returns:
-            feat : (B, encoder_dim, Hf, Wf)，Hf = H / (patch_size * 2^(n-1))
+            feat : (B, encoder_dim, Hf, Wf)
         """
-        x = self.encoder.patch_embed(x)         # channel-last: (B, Hf0, Wf0, C0)
+        x = self.encoder.patch_embed(x)         # channel-last: (B, Hp, Wp, C0)
+
+        # ── 注入位置编码（含 bicubic 插值）────────────────────────────
+        if self.pos_embed is not None:
+            if self.encoder.channel_first:
+                _, _, Hp, Wp = x.shape
+            else:
+                _, Hp, Wp, _ = x.shape
+            pos = self._interpolate_pos_embed(Hp, Wp)
+            if not self.encoder.channel_first:
+                pos = pos.permute(0, 2, 3, 1)   # (1, C, Hp, Wp) → (1, Hp, Wp, C)
+            x = x + pos
+
         for layer in self.encoder.layers:
             x = layer(x)
-        # 统一转为 channel-first (B, C, Hf, Wf) 以供 GroupNorm / decoder 使用
-        if not self.encoder.channel_first:      # norm_layer="ln" → channel_first=False
+        if not self.encoder.channel_first:
             x = x.permute(0, 3, 1, 2).contiguous()
         x = self.enc_norm(x)
         return x
@@ -694,19 +731,25 @@ def save_backbone_weights(path: Path, model: nn.Module, use_ddp: bool):
     """
     仅保存骨干编码器权重（下游任务微调时加载）。
 
+    pos_embed 在 EarthMambaForPretraining 中由本类管理（self.pos_embed），
+    保存时需映射回 EarthMamba 的 key 约定（pos_embed，无前缀）。
+
     使用方法：
-        backbone = BackboneEarthMamba(depths=..., dims=..., patch_size=16, ...)
+        backbone = BackboneEarthMamba(
+            depths=..., dims=..., patch_size=16,
+            posembed=True, imgsize=512, ...
+        )
         backbone.load_state_dict(
             torch.load('backbone_ep0800.pth'), strict=False
         )
     """
     raw = model.module if use_ddp else model
-    # 将 encoder.* 前缀的 key 去掉 "encoder." 前缀，与 EarthMamba/BackboneEarthMamba 兼容
-    sd = {
-        k[len("encoder."):]: v
-        for k, v in raw.state_dict().items()
-        if k.startswith("encoder.")
-    }
+    sd = {}
+    for k, v in raw.state_dict().items():
+        if k.startswith("encoder."):
+            sd[k[len("encoder."):]] = v
+        elif k == "pos_embed":
+            sd["pos_embed"] = v
     torch.save(sd, path)
 
 
@@ -808,9 +851,12 @@ def build_args() -> argparse.Namespace:
     g.add_argument("--primary_prob", type=float, default=0.85,
                    help="使用主分辨率的批次比例 [0.80, 0.90]")
     g.add_argument("--min_scale",    type=float, default=0.85,
-                   help="多尺度最小缩放因子（1-0.15=0.85 → ±15%）")
+                   help="辅尺度下界缩放因子（用于自动生成离散候选表）")
     g.add_argument("--max_scale",    type=float, default=1.15,
-                   help="多尺度最大缩放因子")
+                   help="辅尺度上界缩放因子")
+    g.add_argument("--aux_scales",   type=int, nargs="*", default=None,
+                   help="手动指定辅尺度候选列表（优先于 min/max_scale 自动生成）"
+                        "例: --aux_scales 448 480 544 576")
     g.add_argument("--color_jitter", type=float, default=0.2,
                    help="颜色抖动强度（遥感建议 0.1~0.2，0 = 关闭）")
     g.add_argument("--vflip_prob",   type=float, default=0.5,
@@ -901,6 +947,17 @@ def main():
         if is_master():
             logger.info(f"线性缩放 LR: {args.lr:.2e}  (eff_batch={eff_batch})")
 
+    # ── 离散辅尺度候选表 ────────────────────────────────────────────────────
+    if args.aux_scales is not None:
+        candidates = sorted(args.aux_scales)
+    else:
+        candidates = build_scale_candidates(
+            primary=args.primary_size,
+            patch_size=args.patch_size,
+            min_scale=args.min_scale,
+            max_scale=args.max_scale,
+        )
+
     # ── 数据集 & DataLoader ───────────────────────────────────────────────────
     dataset = PretrainDataset(root=args.data_root, primary_size=args.primary_size)
     sampler = DistributedSampler(dataset, shuffle=True) if use_ddp else None
@@ -908,8 +965,7 @@ def main():
         primary=args.primary_size,
         patch_size=args.patch_size,
         primary_prob=args.primary_prob,
-        min_scale=args.min_scale,
-        max_scale=args.max_scale,
+        candidates=candidates,
         hflip_prob=args.hflip_prob,
         vflip_prob=args.vflip_prob,
         color_jitter=args.color_jitter,
@@ -927,22 +983,20 @@ def main():
     )
 
     if is_master():
-        # 打印分辨率候选列表，方便验证
-        candidates = sorted({
-            snap_to_patch_multiple(args.primary_size * s, args.patch_size)
-            for s in np.linspace(args.min_scale, args.max_scale, 20)
-        })
+        all_scales = sorted([args.primary_size] + candidates)
         logger.info(
             f"数据集: {len(dataset)} 张图像 | "
             f"Loader: {len(loader)} steps/epoch\n"
             f"  主分辨率: {args.primary_size}  (P={args.primary_prob:.0%})\n"
-            f"  多尺度候选 (±{int((args.max_scale-1)*100)}%): {candidates}"
+            f"  辅尺度候选（patch_size={args.patch_size} 整数倍）: {candidates}\n"
+            f"  完整合法尺度表: {all_scales}"
         )
 
     # ── 模型 ─────────────────────────────────────────────────────────────────
     model = EarthMambaForPretraining(
         model_size=args.model_size,
         patch_size=args.patch_size,
+        primary_size=args.primary_size,
         mask_ratio=args.mask_ratio,
         norm_pix_loss=args.norm_pix_loss,
         decoder_hidden=args.decoder_hidden,
