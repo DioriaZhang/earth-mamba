@@ -130,7 +130,7 @@ class SparseSS2D(nn.Module):
         # ----------------------------------------------------
         # 准备 CUDA 输入
         # ----------------------------------------------------
-        u_core = y_scan.view(B, -1, L).contiguous()
+        u_core = y_scan.view(B, -1, L)  # y_scan 来自 Triton，天然 contiguous，view 后仍 contiguous
         
         dt_core = dt.view(B, 4, L, -1).permute(0, 1, 3, 2).contiguous().view(B, -1, L)
         
@@ -154,7 +154,7 @@ class SparseSS2D(nn.Module):
         y_global = y_global.view(B, 4, -1, L)
         
         y = cross_merge_fn(y_global) # (B, D, H, W)
-        
+
         y = y.permute(0, 2, 3, 1).contiguous()  # (B, D, H, W) -> (B, H, W, D)
         y = self.out_norm(y)
 
