@@ -218,7 +218,9 @@ class Mamba3SS2D(nn.Module):
         )
 
         # ── 5. 输出层 ──────────────────────────────────────────────────────────
-        self.out_norm = nn.LayerNorm(self.d_inner)
+        # 使用 RMSNormGated 替代 nn.LayerNorm，避免 BF16 autocast 强制 FP32 转换
+        # RMSNormGated 是 Triton 实现，在 BF16 下保持原生精度，减少 aten::to cast
+        self.out_norm = RMSNormGated(self.d_inner, eps=1e-5)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=conv_bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
