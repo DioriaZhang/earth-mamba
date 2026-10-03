@@ -1,0 +1,21 @@
+task: dfc15
+metric: macro_mAP
+metric_unit: percent
+script: ablation_study/run/task_dfc15.py
+
+data_dir: /hy-tmp/task/DFC15
+ckpt: /hy-tmp/CKPT/PN-log13-ep14/checkpoint.pth
+
+hyperparams:
+  img_size: 224
+  epochs: 80
+  batch_size: 48
+  lr: 1.0e-3
+  encoder_lr: 1.0e-5
+  weight_decay: 0.05
+  ssm_version: mamba3
+  seed: 42
+  amp_dtype: bf16
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true

@@ -1,0 +1,358 @@
+"""baselines2 standalone: dfc15."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# baselines/ 与 downstream_code/ 分离：注入 import 路径
+
+
+import argparse
+import csv
+import json
+import random
+import time
+import warnings
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+
+from downstream_common import (
+    DEFAULT_OUTPUT_DIR,
+    AmpHelper,
+    add_output_args,
+    add_perf_args,
+    add_warmup_args,
+    args_to_dict,
+    build_warmup_cosine_scheduler,
+    loader_kwargs,
+    maybe_compile,
+    param_groups_weight_decay,
+    resolve_out_dir,
+    print_final_summary,
+    setup_perf,
+)
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+
+DFC15_CLASSES = (
+    "impervious", "water", "clutter", "vegetation",
+    "building", "tree", "boat", "car",
+)
+NUM_LABELS = len(DFC15_CLASSES)
+
+
+# ─────────────────────────── 数据集工具 ──────────────────────────────────────
+
+def _parse_label_line(line: str) -> Tuple[str, List[int]]:
+    parts = line.replace(",", " ").split()
+    name = parts[0]
+    vals = [int(float(x)) for x in parts[1:]]
+    if len(vals) < NUM_LABELS:
+        raise ValueError(f"标签维度不足 {NUM_LABELS}: {line[:80]}")
+    return name, vals[:NUM_LABELS]
+
+
+def resolve_dfc15_base(root: Path) -> Path:
+    for base in (root, root / "DFC15_multilabel"):
+        if (base / "multilabel.csv").is_file() or (base / "images_tr").is_dir():
+            return base
+    raise FileNotFoundError(f"未找到 DFC15_multilabel 布局: {root}")
+
+
+def load_multilabel_csv(csv_path: Path) -> Dict[str, List[int]]:
+    """解析 multilabel.csv：首列文件名，后 8 列 0/1。"""
+    label_map: Dict[str, List[int]] = {}
+    with csv_path.open(encoding="utf-8", errors="ignore", newline="") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    if not rows:
+        raise FileNotFoundError(f"空 CSV: {csv_path}")
+    start = 0
+    first = rows[0]
+    if first and not first[0].lower().endswith((".tif", ".tiff", ".jpg", ".jpeg", ".png")):
+        try:
+            [int(float(x)) for x in first[1:1 + NUM_LABELS]]
+        except ValueError:
+            start = 1
+    for row in rows[start:]:
+        if len(row) < NUM_LABELS + 1:
+            continue
+        name = row[0].strip()
+        if not name:
+            continue
+        vals = [int(float(x)) for x in row[1:1 + NUM_LABELS]]
+        label_map[name] = vals
+        label_map[Path(name).stem] = vals
+    if not label_map:
+        raise FileNotFoundError(f"{csv_path} 未解析到有效标签行")
+    return label_map
+
+
+def _match_image(img_dir: Path, name: str) -> Optional[Path]:
+    stem = Path(name).stem
+    for cand in (img_dir / name, img_dir / f"{stem}.tif", img_dir / f"{stem}.tiff",
+                 img_dir / f"{stem}.jpg", img_dir / f"{stem}.png"):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def resolve_dfc15_split(root: Path, split: str) -> Tuple[Path, Path]:
+    """旧布局：返回 (img_dir, label_file)。"""
+    candidates = [
+        (root / split / "images", root / split / "multilabels.txt"),
+        (root / "images", root / f"{split}_multilabels.txt"),
+        (root / split, root / split / "labels.txt"),
+    ]
+    for img_dir, lbl_file in candidates:
+        if img_dir.is_dir() and lbl_file.is_file():
+            return img_dir, lbl_file
+    raise FileNotFoundError(f"未找到 DFC15 {split} 旧布局: {root}")
+
+
+def build_dfc15_samples(
+    img_dir: Path, label_map: Dict[str, List[int]]
+) -> List[Tuple[Path, torch.Tensor]]:
+    samples: List[Tuple[Path, torch.Tensor]] = []
+    seen: set = set()
+    for img_path in sorted(img_dir.iterdir()):
+        if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+            continue
+        key = img_path.name
+        labels = label_map.get(key) or label_map.get(img_path.stem)
+        if labels is None:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        samples.append((img_path, torch.tensor(labels, dtype=torch.float32)))
+    if not samples:
+        raise FileNotFoundError(f"{img_dir} 与 multilabel.csv 无匹配样本")
+    return samples
+
+
+class DFC15Dataset(Dataset):
+    def __init__(
+        self,
+        img_dir: Path,
+        label_file: Optional[Path] = None,
+        label_map: Optional[Dict[str, List[int]]] = None,
+        img_size: int = 224,
+        augment: bool = False,
+        strong_augment: bool = False,
+    ):
+        self.img_size = img_size
+        self.augment = augment
+        self.strong_augment = strong_augment
+        self.samples: List[Tuple[Path, torch.Tensor]] = []
+        self._to_tensor = transforms.ToTensor()
+        self._normalize = transforms.Normalize(MEAN, STD)
+        self._jitter = transforms.ColorJitter(
+            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
+        )
+        if label_map is not None:
+            self.samples = build_dfc15_samples(img_dir, label_map)
+        elif label_file is not None:
+            for line in label_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                name, labels = _parse_label_line(line)
+                p = _match_image(img_dir, name)
+                if p is not None:
+                    self.samples.append((p, torch.tensor(labels, dtype=torch.float32)))
+        if not self.samples:
+            raise FileNotFoundError(f"DFC15 {img_dir} 未匹配到带标签图片")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        img = Image.open(str(path)).convert("RGB")
+        if self.strong_augment:
+            scale = (0.2, 1.0)
+            i, j, h, w = transforms.RandomResizedCrop.get_params(
+                img, scale=scale, ratio=(3 / 4, 4 / 3)
+            )
+            img = transforms.functional.resized_crop(
+                img, i, j, h, w, (self.img_size, self.img_size),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            )
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            if random.random() < 0.3:
+                img = self._jitter(img)
+        elif self.augment:
+            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        else:
+            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+        img = self._normalize(self._to_tensor(img))
+        return img, label
+
+
+# ─────────────────────────── 分类模型 ────────────────────────────────────────
+
+class MultiBackboneClassifier(nn.Module):
+    """多 backbone 多标签分类器（DFC15，全量微调）。
+
+    流水线：Image → Backbone → GAP → Linear(embed_dim_last, NUM_LABELS) → Logits
+    """
+
+    def __init__(self, encoder: nn.Module, out_dims: List[int], num_labels: int = NUM_LABELS):
+        super().__init__()
+        self.encoder = encoder
+        embed_dim_last = out_dims[-1]
+        self.head = nn.Linear(embed_dim_last, num_labels)
+        nn.init.trunc_normal_(self.head.weight, std=0.01)
+        nn.init.zeros_(self.head.bias)
+        n_total = sum(p.numel() for p in self.parameters())
+        print(f"  全量微调：总参数 {n_total:,}（backbone + GAP + Linear）")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.encoder(x)
+        # 取最深特征，GAP → Linear
+        feat = feats[-1]  # (B, C, H, W)
+        feat = feat.mean(dim=[2, 3])  # GAP → (B, C)
+        return self.head(feat)
+
+
+# ─────────────────────────── 指标计算 ────────────────────────────────────────
+
+def _binary_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """单标签 AP（与 sklearn average_precision_score 逐步积分一致）。"""
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+    n_pos = int(y_true.sum())
+    if n_pos == 0:
+        return 0.0
+    order = np.argsort(-y_score, kind="mergesort")
+    y_true = y_true[order]
+    tp = np.cumsum(y_true)
+    fp = np.cumsum(1 - y_true)
+    precision = tp / np.maximum(tp + fp, 1)
+    recall = tp / n_pos
+    ap = 0.0
+    prev_recall = 0.0
+    for i in range(len(y_true)):
+        if y_true[i]:
+            ap += precision[i] * (recall[i] - prev_recall)
+            prev_recall = recall[i]
+    return float(ap)
+
+
+def _f1_binary(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    tp = float((y_pred & y_true).sum())
+    fp = float((y_pred & ~y_true).sum())
+    fn = float((~y_pred & y_true).sum())
+    if tp == 0:
+        return 0.0
+    p = tp / (tp + fp)
+    r = tp / (tp + fn)
+    return 2.0 * p * r / (p + r)
+
+
+def multilabel_metrics(
+    logits: torch.Tensor, targets: torch.Tensor, thresh: float = 0.5
+) -> Dict[str, float]:
+    """遥感多标签指标（DFC15 / ML-Mamba 口径，纯 numpy）。
+
+    主指标 macro-mAP（mAP 键）：各类 AP 简单平均，顶会主报口径。
+    """
+    prob = logits.float().sigmoid().numpy()
+    y_true = targets.float().numpy().astype(np.int32)
+    y_pred = (prob >= thresh).astype(np.int32)
+    n_classes = y_true.shape[1]
+
+    per_class_ap = []
+    for c in range(n_classes):
+        ap = _binary_average_precision(y_true[:, c], prob[:, c])
+        per_class_ap.append(ap)
+    per_class_ap_dict = {cls: float(ap) for cls, ap in zip(DFC15_CLASSES, per_class_ap)}
+    macro_map = float(np.mean(per_class_ap))
+    micro_map = _binary_average_precision(y_true.ravel(), prob.ravel())
+
+    micro_f1 = _f1_binary(y_true.ravel(), y_pred.ravel())
+    macro_f1 = float(np.mean([
+        _f1_binary(y_true[:, c].astype(bool), y_pred[:, c].astype(bool))
+        for c in range(n_classes)
+    ]))
+
+    tp = float((y_pred & y_true).sum())
+    fp = float((y_pred & ~y_true).sum())
+    fn = float((~y_pred & y_true).sum())
+    micro_prec = tp / (tp + fp + 1e-8)
+    micro_rec = tp / (tp + fn + 1e-8)
+    exact = float((y_pred == y_true).all(axis=1).mean())
+
+    return {
+        "mAP": macro_map,
+        "macro_mAP": macro_map,
+        "micro_mAP": micro_map,
+        "micro_F1": micro_f1,
+        "macro_F1": macro_f1,
+        "f1": micro_f1,
+        "precision": micro_prec,
+        "recall": micro_rec,
+        "exact_match": exact,
+        "per_class_AP": per_class_ap_dict,
+    }
+
+
+# ─────────────────────────── 训练 / 评估循环 ─────────────────────────────────
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
+             amp: Optional[AmpHelper] = None) -> Dict[str, float]:
+    model.eval()
+    logits_all, targets_all = [], []
+    for imgs, lbl in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        if amp is not None and amp.enabled:
+            with amp.autocast():
+                logits_all.append(model(imgs).cpu())
+        else:
+            logits_all.append(model(imgs).cpu())
+        targets_all.append(lbl)
+    logits = torch.cat(logits_all)
+    targets = torch.cat(targets_all)
+    return multilabel_metrics(logits, targets)
+
+
+def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer,
+                    device: torch.device, epoch: int, args) -> float:
+    model.train()
+    amp: AmpHelper = args.amp_helper
+    total_loss, n = 0.0, 0
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1:03d}/{args.epochs}", dynamic_ncols=True)
+    for imgs, lbl in pbar:
+        imgs = imgs.to(device, non_blocking=True)
+        lbl = lbl.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with amp.autocast():
+            loss = F.binary_cross_entropy_with_logits(model(imgs), lbl)
+        amp.backward_step(loss, optimizer, model, args.clip_grad)
+        total_loss += loss.item()
+        n += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+    return total_loss / max(1, n)
+
+
+# ─────────────────────────── 入口 ────────────────────────────────────────────

@@ -1,0 +1,58 @@
+# 三模块组合消融（ID1/3/4/5/6/7/8 跑，ID9 引用主表）
+
+checkpoint: /hy-tmp/CKPT/PN-log13-ep14/checkpoint.pth
+ssm_version: mamba3
+
+variants:
+  ID1:
+    label: "Pure Baseline"
+    use_sparse_ssm: false
+    use_graph: false
+    use_armg: false
+    run: true
+  ID3:
+    label: "A only"
+    use_sparse_ssm: true
+    use_graph: false
+    use_armg: false
+    run: true
+  ID4:
+    label: "B only"
+    use_sparse_ssm: false
+    use_graph: true
+    use_armg: false
+    run: true
+  ID5:
+    label: "C only"
+    use_sparse_ssm: false
+    use_graph: false
+    use_armg: true
+    run: true
+  ID6:
+    label: "A+B"
+    use_sparse_ssm: true
+    use_graph: true
+    use_armg: false
+    run: true
+  ID7:
+    label: "A+C"
+    use_sparse_ssm: true
+    use_graph: false
+    use_armg: true
+    run: true
+  ID8:
+    label: "B+C"
+    use_sparse_ssm: false
+    use_graph: true
+    use_armg: true
+    run: true
+  ID9:
+    label: "Full"
+    use_sparse_ssm: true
+    use_graph: true
+    use_armg: true
+    run: false
+    reference:
+      inria_val_miou: 85.59
+      dfc15_macro_map: 97.54
+      dior_map50: 61.60

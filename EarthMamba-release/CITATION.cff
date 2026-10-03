@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated EarthMamba paper."
+title: "EarthMamba"
+type: software
+authors:
+  - family-names: "Anonymous"
+    given-names: "Authors"
+version: "0.1.0"
+license: "Apache-2.0"
+abstract: >-
+  Official implementation of EarthMamba, a hierarchical Mamba-based
+  backbone for remote-sensing visual representation learning.
+preferred-citation:
+  type: conference-paper
+  title: "EarthMamba"
+  authors:
+    - family-names: "Anonymous"
+      given-names: "Authors"

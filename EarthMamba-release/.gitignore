@@ -1,0 +1,77 @@
+# Git internals
+.git/
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+conda_env/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Large model artifacts
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.tar
+*.tar.gz
+*.zip
+
+# Dataset indexes and data stores
+train_list.txt
+*train_list*.txt
+*.lmdb
+*.mdb
+*.lock
+datasets/
+data/
+raw_data/
+processed_data/
+shards/
+tar_shards/
+
+# Training/evaluation outputs
+outputs/
+output/
+work_dirs/
+runs/
+wandb/
+tensorboard/
+pretrain_out/
+downstream_result/
+checkpoints/*/
+!checkpoints/README.md
+
+# Large or raw logs; keep curated README/Markdown summaries
+logs/**/*.jsonl
+logs/**/resource_log*.json
+logs/**/resource_log*.jsonl
+logs/**/step_log*.jsonl
+logs/**/launch_cmd.txt
+logs/**/*.png
+logs/**/*.pth
+logs/**/*.pt
+!logs/**/README.md
+!logs/**/*.md

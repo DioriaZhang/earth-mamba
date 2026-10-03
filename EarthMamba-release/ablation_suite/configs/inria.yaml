@@ -1,0 +1,27 @@
+task: inria
+metric: val_mIoU
+metric_unit: percent
+script: ablation_study/run/task_inria.py
+
+data_dir: /hy-tmp/task/INRIA
+ckpt: /hy-tmp/CKPT/PN-log13-ep14/checkpoint.pth
+
+hyperparams:
+  patch_size: 512
+  epochs: 80
+  batch_size: 6
+  lr: 1.0e-3
+  encoder_lr: 1.0e-5
+  adapter_lr: 1.0e-3
+  weight_decay: 1.0e-4
+  dense_adapter: gated_pyramid
+  ssm_version: mamba3
+  seed: 42
+  building_weight: 1.0
+  dice_weight: 0.5
+  samples_per_tile: 8
+  val_ratio: 0.2
+  amp_dtype: bf16
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true

@@ -1,0 +1,15 @@
+# Downstream benchmark suite (DFC15 / PatternNet / INRIA / DeepGlobe / DIOR / DIOR-R)
+# Install PyTorch for your CUDA build first if needed.
+
+torch>=2.5.0
+torchvision>=0.20.0
+timm>=1.0.0
+numpy>=1.24.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+einops>=0.7.0
+PyYAML>=6.0
+
+# Earth-Mamba backbone (install separately, editable):
+#   pip install -e ../earth-mamba
+#   pip install -e ../earth-mamba/kernels/selective_scan   # if using mamba3 CUDA kernels

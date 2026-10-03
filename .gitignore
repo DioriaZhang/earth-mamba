@@ -1,13 +1,25 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
 __pycache__/
-*.pyc
-*.so
-*.o
+*.py[cod]
+*.egg-info/
 build/
 dist/
-*.egg-info/
+.venv/
+venv/
+
+# Large model / data artifacts (keep binaries out of git)
 *.pth
+*.pt
 *.ckpt
-.vscode/
-.idea/
-dataset/
-wandb/
+*.safetensors
+*.tar
+*.tar.gz
+*.zip

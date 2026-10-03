@@ -1,0 +1,51 @@
+{
+  "dataset": "dfc15",
+  "variant": "ID1",
+  "logic": "原始基线（Pure Baseline）",
+  "source": "results.json",
+  "results_json": "/hy-tmp/downstream_results/ablation_study/dfc15/ID1/results.json",
+  "best_epoch": 52,
+  "primary_metric": "macro_mAP",
+  "primary_metric_value": 0.8816576821364854,
+  "best_epoch_record": {
+    "epoch": 52,
+    "train_loss": 0.22955331871552126,
+    "macro_mAP": 0.8816576821364854,
+    "mAP": 0.8816576821364854,
+    "micro_mAP": 0.9532350454529049
+  },
+  "run_meta": {
+    "args": {
+      "data_dir": "/hy-tmp/task/DFC15",
+      "ckpt": "/hy-tmp/CKPT/PN-log13-ep14/checkpoint.pth",
+      "output_dir": "/hy-tmp/downstream_results/ablation_study/dfc15/ID1",
+      "img_size": 224,
+      "epochs": 80,
+      "batch_size": 48,
+      "lr": 0.001,
+      "encoder_lr": 1e-05,
+      "weight_decay": 0.05,
+      "clip_grad": 1.0,
+      "ssm_version": "mamba3",
+      "ablation_variant": "ID1",
+      "no_sparse": true,
+      "no_graph": true,
+      "no_armg": true,
+      "dry_run": false,
+      "num_workers": 8,
+      "seed": 42,
+      "amp_dtype": "bf16",
+      "prefetch_factor": 4,
+      "persistent_workers": true,
+      "compile": false,
+      "warmup_epochs": 3,
+      "min_lr_ratio": 0.0
+    },
+    "best_epoch": 52,
+    "best_metrics": {
+      "macro_mAP": 0.8816576821364854,
+      "mAP": 0.8816576821364854,
+      "micro_mAP": 0.9532350454529049
+    }
+  }
+}

@@ -1,0 +1,26 @@
+task: dior
+metric: mAP@0.5
+metric_unit: percent
+script: ablation_study/run/task_dior.py
+
+data_dir: /hy-tmp/task/DIOR
+ckpt: /hy-tmp/CKPT/PN-log13-ep14/checkpoint.pth
+
+hyperparams:
+  img_size: 512
+  epochs: 20
+  batch_size: 4
+  lr: 2.0e-4
+  encoder_lr: 1.0e-5
+  adapter_lr: 2.0e-4
+  weight_decay: 1.0e-4
+  grad_accum: 2
+  dense_adapter: semantic_pyramid
+  ssm_version: mamba3
+  seed: 42
+  amp_dtype: none
+  warmup_epochs: 2
+  eval_interval: 5
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true

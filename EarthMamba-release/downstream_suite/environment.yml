@@ -1,0 +1,22 @@
+name: downstream-suite
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.24
+  - pillow>=10
+  - tqdm>=4.65
+  - pyyaml>=6
+  - pytorch>=2.5
+  - torchvision>=0.20
+  - pytorch-cuda=12.4
+  - pip:
+      - timm>=1.0.0
+      - einops>=0.7.0
+      # After env create, install Earth-Mamba from repo root:
+      #   pip install -e ../earth-mamba
+      #   pip install -e ../earth-mamba/kernels/selective_scan

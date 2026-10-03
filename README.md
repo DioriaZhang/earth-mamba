@@ -1,49 +1,153 @@
-# earth-mamba
+# EarthMamba
 
-由 `dualsg_mamba` 复制的遥感向 Vision Mamba 变体：三路设计分别对应 **compression-aware** 稀疏 SSM、**noise-robust** 门控（ARMG）与 **多向扫描 + 语义图** 全局分支（非严格旋转不变）。
+[English](#english) · [中文](#中文)
 
-## 安装
+---
 
-在项目根目录（本目录）执行：
+## English
 
-```bash
-pip install -e ./kernels/selective_scan
-pip install -e .
+EarthMamba is a hierarchical Mamba (state-space model) backbone for remote-sensing visual representation learning. The design combines a **compression-aware** sparse SSM path, a **noise-robust** gated branch (ARMG), and a **multi-directional scan + semantic-graph** global branch.
+
+This repository hosts the whole project in two top-level folders:
+
+- **`earth-mamba/`** — the core model package (the original development repository): the `earth_mamba` Python package, the custom `selective_scan` CUDA kernel, Triton Mamba-3 operators, and a training entry point.
+- **`EarthMamba-release/`** — the paper release package: SimMIM-style masked image modeling pretraining, the data-processing pipeline, downstream task suites (classification, semantic segmentation, horizontal-box and oriented-box detection), an ablation suite, and model-zoo / docs.
+
+### Repository layout
+
+```
+.
+├── earth-mamba/                  # Core model package (original dev repo)
+│   ├── earth_mamba/              # Python package: EarthMamba / BackboneEarthMamba / EarthMambaBlock
+│   ├── kernels/selective_scan/   # Custom selective-scan CUDA kernel
+│   ├── train.py  setup.py  env.yml  requirements.txt
+│   └── README.md
+├── EarthMamba-release/           # Paper release package
+│   ├── train/                    # SimMIM-style masked pretraining
+│   ├── data_process/             # Data-processing pipeline
+│   ├── downstream_suite/         # Classification / segmentation / HBB / OBB detection
+│   ├── ablation_suite/           # Ablation studies
+│   ├── checkpoints/  docs/  examples/  figure1_vis/  logs/
+│   ├── DATA.md  MODEL_ZOO.md  LICENSE  CITATION.cff  THIRD_PARTY_NOTICES.md
+│   └── README.md
+└── README.md                     # This file
 ```
 
-依赖见 `requirements.txt`（其中本地算子已改为 `-e ./kernels/selective_scan`）。
+Model configurations: **Tiny** `[2, 2, 9, 2]` / `[96, 192, 384, 768]`, **Small** `[2, 2, 27, 2]` / `[96, 192, 384, 768]`, **Base** `[2, 2, 27, 2]` / `[128, 256, 512, 1024]`.
 
-## SSM 后端
+### Installation
 
-- 默认：已编译的 `selective_scan_cuda` / `oflex`（与 VMamba 风格四向 scan 配合）。
-- 纯 PyTorch 参考（可反传，用于对接 Mamba-3 等新 recurrence 前的链路验证）：
+Run from the repository root:
 
 ```bash
-set EARTH_MAMBA_SSM_BACKEND=torch_easy   # Windows CMD
-# 或 PowerShell: $env:EARTH_MAMBA_SSM_BACKEND="torch_easy"
+python -m pip install -r earth-mamba/requirements.txt
+python -m pip install -e earth-mamba/kernels/selective_scan
+python -m pip install -e earth-mamba
 ```
 
-或在构造 `SparseSS2D` 时传入 `ssm_backend="torch_easy"`。
+Optional downstream / data-processing dependencies:
 
-## 模型入口
+```bash
+python -m pip install -r EarthMamba-release/downstream_suite/requirements.txt
+python -m pip install -r EarthMamba-release/data_process/requirements.txt
+```
+
+### Quick start
 
 ```python
-from earth_mamba import EarthMamba, BackboneEarthMamba, EarthMambaBlock
+import torch
+from earth_mamba.models.earth_mamba import EarthMamba
+
+model = EarthMamba(
+    imgsize=224, patch_size=16, in_chans=3, num_classes=1000,
+    depths=[2, 2, 27, 2], dims=[96, 192, 384, 768],
+    ssm_version="mamba3", ssm_d_state=64, ssm_headdim=64,
+    posembed=True, downsample_version="v3",
+)
+logits = model(torch.randn(1, 3, 224, 224))
 ```
 
-## 训练（与 `train_ddp_configs_benchmark_v2_monitor.py`）
+See `EarthMamba-release/README.md` for pretraining and downstream commands; paths there are relative to the repository root.
 
-- **BF16**：`--amp --amp_dtype bf16`（A100/H100 推荐）；FP16 时用 `--amp_dtype fp16` 且会启用 `GradScaler`。
-- **selective_scan 保持 FP32**：`--ssm_fp32` 或环境变量 `EARTH_MAMBA_SELECTIVE_SCAN_FP32=1`（与 BF16 可同时开，内核内升精度）。
-- **Gradient checkpoint**：`--use_grad_checkpoint`（EarthMamba 的 `use_checkpoint`）。
-- **FSDP 多卡分片**：`--fsdp`（需多卡 DDP；类 ZeRO-3；**DeepSpeed ZeRO** 需单独装 deepspeed 配置）。
-- **patch**：`--patch_size 16` 减少 token 数（与 `img_size` 搭配）。
-- **DataLoader**：`--num_workers` / `--prefetch_factor` / `--persistent_workers`；**LMDB**：`--lmdb_path`（需 `pip install lmdb`，键 `__len__` + 索引）。
-- **路径**：脚本与 `earth-mamba`、`dualsg_mamba` 同父目录时自动加入 `sys.path`；或设 `MAMBA_PROJECT_ROOT`。
+### Status
 
-## 静态逻辑核对（无需跑 GPU）
+EarthMamba was submitted to **AAAI 2027** and was **not accepted** (review scores 5 / 5 / 4 / 4). The code is released as-is for reference.
 
-1. **数据流**：`EarthMambaBlock` 中 x → norm1 → ARMG（软门控）→ 与 z 残差混合 → 同一份 z 并行送入 SparseSS2D（Path A）与 LatentGraph（Path B）→ y_sparse + λ·y_graph → 与 x 残差 → norm2 + MLP 残差。ARMG 在 SSM/图之前，与文档「先抗干扰再进 SSM」一致。
-2. **Compression-aware**：`SparseSS2D` 中 `sparse_gate` 对展平序列维做 Sparsemax，得到 `m_t` 与 `B_mat` 相乘后再送入 `selective_scan_fn`；四向 `cross_scan_fn` / `cross_merge_fn` 仅改变序列化顺序与合并，不改变该门控语义。
-3. **SSM 后端分发**：`selective_scan_fn` 若 `eff == "torch_easy"`（由参数 `backend` 或环境变量 `EARTH_MAMBA_SSM_BACKEND` 决定，**显式参数优先**）则走 `selective_scan_torch_easy`（动态加载 `kernels/selective_scan/test_selective_scan_easy.py` 中的 `SelectiveScanEasy`）；否则走 `SelectiveScanCuda`，`backend=None` 时使用编译扩展探测到的 `SS_BACKEND`（`oflex` 或 `mamba`）。
-4. **自定义 `ssm_cls`**：`EarthMambaBlock` 仅在 `inspect.signature(OpClass.__init__).parameters` 含 `ssm_backend` 时才传入该参数，避免 Baseline 类构造报错。
+### License and third-party notice
+
+Project-original code is released under **Apache-2.0** (`EarthMamba-release/LICENSE`). This does not relicense third-party code, kernels, dependencies, datasets, or weights. See `EarthMamba-release/THIRD_PARTY_NOTICES.md`.
+
+---
+
+## 中文
+
+EarthMamba 是一个面向遥感视觉表征学习的分层 Mamba（状态空间模型）骨干网络，由三路设计组成：**compression-aware** 稀疏 SSM、**noise-robust** 门控分支（ARMG），以及**多向扫描 + 语义图**的全局分支。
+
+本仓库以两个顶层文件夹承载整个项目：
+
+- **`earth-mamba/`** —— 核心模型包（原开发仓库）：`earth_mamba` Python 包、自定义 `selective_scan` CUDA 内核、Triton Mamba-3 算子，以及训练入口。
+- **`EarthMamba-release/`** —— 论文发布包：SimMIM 式掩码图像建模预训练、数据处理管线、下游任务套件（分类、语义分割、水平框与旋转框检测）、消融套件，以及模型动物园与文档。
+
+### 目录结构
+
+```
+.
+├── earth-mamba/                  # 核心模型包（原开发仓库）
+│   ├── earth_mamba/              # Python 包：EarthMamba / BackboneEarthMamba / EarthMambaBlock
+│   ├── kernels/selective_scan/   # 自定义 selective-scan CUDA 内核
+│   ├── train.py  setup.py  env.yml  requirements.txt
+│   └── README.md
+├── EarthMamba-release/           # 论文发布包
+│   ├── train/                    # SimMIM 式掩码预训练
+│   ├── data_process/             # 数据处理管线
+│   ├── downstream_suite/         # 分类 / 语义分割 / 水平框 / 旋转框检测
+│   ├── ablation_suite/           # 消融实验
+│   ├── checkpoints/  docs/  examples/  figure1_vis/  logs/
+│   ├── DATA.md  MODEL_ZOO.md  LICENSE  CITATION.cff  THIRD_PARTY_NOTICES.md
+│   └── README.md
+└── README.md                     # 本文件
+```
+
+模型配置：**Tiny** `[2, 2, 9, 2]` / `[96, 192, 384, 768]`，**Small** `[2, 2, 27, 2]` / `[96, 192, 384, 768]`，**Base** `[2, 2, 27, 2]` / `[128, 256, 512, 1024]`。
+
+### 安装
+
+在仓库根目录执行：
+
+```bash
+python -m pip install -r earth-mamba/requirements.txt
+python -m pip install -e earth-mamba/kernels/selective_scan
+python -m pip install -e earth-mamba
+```
+
+可选的下游 / 数据处理依赖：
+
+```bash
+python -m pip install -r EarthMamba-release/downstream_suite/requirements.txt
+python -m pip install -r EarthMamba-release/data_process/requirements.txt
+```
+
+### 快速开始
+
+```python
+import torch
+from earth_mamba.models.earth_mamba import EarthMamba
+
+model = EarthMamba(
+    imgsize=224, patch_size=16, in_chans=3, num_classes=1000,
+    depths=[2, 2, 27, 2], dims=[96, 192, 384, 768],
+    ssm_version="mamba3", ssm_d_state=64, ssm_headdim=64,
+    posembed=True, downsample_version="v3",
+)
+logits = model(torch.randn(1, 3, 224, 224))
+```
+
+预训练与下游命令见 `EarthMamba-release/README.md`，其中路径均相对仓库根目录。
+
+### 状态
+
+EarthMamba 投稿 **AAAI 2027**，**未录用**（评审分数 5 / 5 / 4 / 4）。代码按原样发布，供参考。
+
+### 许可与第三方声明
+
+项目原创代码以 **Apache-2.0** 许可发布（`EarthMamba-release/LICENSE`）。该许可不覆盖第三方代码、内核、依赖、数据集或权重。详见 `EarthMamba-release/THIRD_PARTY_NOTICES.md`。

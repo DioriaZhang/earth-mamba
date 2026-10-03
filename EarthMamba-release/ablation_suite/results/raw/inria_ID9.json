@@ -1,0 +1,21 @@
+{
+  "dataset": "inria",
+  "variant": "ID9",
+  "logic": "完整",
+  "source": "main_table_reference",
+  "results_json": null,
+  "best_epoch": null,
+  "primary_metric": "inria_val_miou",
+  "primary_metric_value": 85.59,
+  "best_epoch_record": {
+    "note": "ID9 未重跑，无 history；下列为引用主表数值",
+    "inria_val_miou": 85.59
+  },
+  "run_meta": {
+    "reference": {
+      "inria_val_miou": 85.59,
+      "dfc15_macro_map": 97.54,
+      "dior_map50": 61.6
+    }
+  }
+}
